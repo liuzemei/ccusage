@@ -27,7 +27,7 @@ catalogs:
     '@gunshi/docs': ^0.31.0
     '@praha/byethrow-docs': ^0.11.2
   release:
-    bumpp: ^10.2.3
+    bumpp: ^11.1.0
     changelogithub: ^13.16.1
     clean-pkg-json: ^1.3.0
     lefthook: ^2.1.6
