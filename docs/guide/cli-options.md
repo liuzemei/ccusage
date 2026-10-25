@@ -101,10 +101,12 @@ ccusage daily --order asc
 Run without network connectivity:
 
 ```bash
-# Use cached pricing data
+# Use the pricing embedded in ccusage
 ccusage daily --offline
 ccusage daily -O
 ```
+
+Without `--offline`, ccusage prices from the LiteLLM pricing it cached on disk while the server confirmed that copy within the last 24 hours, and refreshes it before the report otherwise. When the cached copy has no entry for a model the report needs, ccusage refreshes it for that run, at most once an hour.
 
 ### Timezone
 
