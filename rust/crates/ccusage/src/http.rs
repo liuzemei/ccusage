@@ -6,10 +6,10 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
-use ccusage_core::pricing::PricingEndpoint;
+use ccusage_core::pricing::{FreshJson, PricingEndpoint};
 
 mod tls;
 
@@ -27,6 +27,7 @@ const CACHE_FILE_MAX_BYTES: u64 = PRICING_FETCH_MAX_BYTES + CACHE_ETAG_MAX_BYTES
 /// Each response body is kept on disk next to its ETag, and later fetches
 /// revalidate with `If-None-Match`. A cached body is used only after the server
 /// confirms it with a 304 and the body passes the endpoint's pricing validator.
+/// That confirmation renews the entry for [`read_fresh_json`].
 pub(crate) fn fetch_json(url: &str) -> io::Result<String> {
     let endpoint = PricingEndpoint::for_url(url).ok_or_else(|| {
         io::Error::new(
@@ -36,6 +37,39 @@ pub(crate) fn fetch_json(url: &str) -> io::Result<String> {
     })?;
     let cache_dir = default_cache_dir();
     fetch_json_with_cache_dir(url, cache_dir.as_deref(), endpoint)
+}
+
+/// Returns the cached pricing document for `url` and its age when the server
+/// last confirmed it within `max_age`, without a request.
+///
+/// A 200 writes the entry and a 304 renews it, so its modification time is
+/// when the server last vouched for the body. The body still has to pass the
+/// endpoint's pricing validator, as it does after a 304.
+pub(crate) fn read_fresh_json(url: &str, max_age: Duration) -> Option<FreshJson> {
+    let endpoint = PricingEndpoint::for_url(url)?;
+    let cache_dir = default_cache_dir()?;
+    read_fresh_json_in(&cache_dir, url, endpoint, max_age, SystemTime::now())
+}
+
+fn read_fresh_json_in(
+    cache_dir: &Path,
+    url: &str,
+    endpoint: PricingEndpoint,
+    max_age: Duration,
+    now: SystemTime,
+) -> Option<FreshJson> {
+    let cache = CacheEntry::for_url(cache_dir, url);
+    // A confirmation time in the future fails `duration_since`, so a skewed
+    // clock costs a request rather than extending the entry's life.
+    let age = now.duration_since(cache.confirmed_at()?).ok()?;
+    if age > max_age {
+        return None;
+    }
+    let cached = cache.read()?;
+    endpoint.validates(&cached.body).then_some(FreshJson {
+        body: cached.body,
+        age,
+    })
 }
 
 /// Returns a per-user cache directory, or `None` when no safe directory exists.
@@ -100,6 +134,9 @@ fn fetch_json_with_cache_dir_inner(
             return Err(io::Error::other("HTTP 304 without a cached body"));
         };
         if endpoint.validates(&cached.body) {
+            if let Some(cache) = cache.as_ref() {
+                cache.renew();
+            }
             return Ok(cached.body);
         }
         if let Some(cache) = cache.as_ref() {
@@ -241,6 +278,21 @@ impl CacheEntry {
     fn invalidate(&self) {
         let _ = fs::remove_file(&self.path);
     }
+
+    /// When the server last confirmed the cached body.
+    fn confirmed_at(&self) -> Option<SystemTime> {
+        fs::metadata(&self.path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    }
+
+    /// Records that the server confirmed the cached body again.
+    fn renew(&self) {
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .and_then(|file| file.set_modified(SystemTime::now()));
+    }
 }
 
 /// Derives a filesystem-safe, collision-resistant file stem from a URL.
@@ -270,7 +322,7 @@ fn cache_file_stem(url: &str) -> String {
 mod tests {
     use super::{
         CacheEntry, PRICING_FETCH_MAX_BYTES, PricingEndpoint, cache_dir_under, cache_file_stem,
-        fetch_json_with_cache_dir, read_bounded_body,
+        fetch_json_with_cache_dir, read_bounded_body, read_fresh_json_in,
     };
     use ccusage_test_support::Fixture;
     use std::{
@@ -279,8 +331,10 @@ mod tests {
         net::{TcpListener, TcpStream},
         path::PathBuf,
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     };
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
     const LITELLM_BODY: &str =
         r#"{"gpt-test":{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002}}"#;
@@ -733,6 +787,113 @@ mod tests {
             .expect("test server")
             .expect("server response");
         assert_eq!(entry.read().expect("cache remains").body, LITELLM_BODY);
+    }
+
+    #[test]
+    fn reads_a_recently_confirmed_cache_body_without_a_request() {
+        let fixture = Fixture::new();
+        let dir = fixture.path("http-cache");
+        let url = "https://example.com/pricing.json";
+        let entry = CacheEntry::for_url(&dir, url);
+        entry.write("\"cached\"", LITELLM_BODY);
+        let confirmed_at = entry.confirmed_at().expect("cache entry has a timestamp");
+
+        let fresh = read_fresh_json_in(
+            &dir,
+            url,
+            PricingEndpoint::LiteLlm,
+            DAY,
+            confirmed_at + Duration::from_secs(60 * 60),
+        )
+        .expect("a cache confirmed an hour ago is fresh");
+
+        assert_eq!(fresh.body, LITELLM_BODY);
+        assert_eq!(fresh.age, Duration::from_secs(60 * 60));
+    }
+
+    #[test]
+    fn does_not_read_a_cache_body_older_than_the_max_age() {
+        let fixture = Fixture::new();
+        let dir = fixture.path("http-cache");
+        let url = "https://example.com/pricing.json";
+        let entry = CacheEntry::for_url(&dir, url);
+        entry.write("\"cached\"", LITELLM_BODY);
+        let confirmed_at = entry.confirmed_at().expect("cache entry has a timestamp");
+
+        let body = read_fresh_json_in(
+            &dir,
+            url,
+            PricingEndpoint::LiteLlm,
+            DAY,
+            confirmed_at + DAY + Duration::from_secs(1),
+        );
+
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn does_not_read_a_cache_body_confirmed_in_the_future() {
+        let fixture = Fixture::new();
+        let dir = fixture.path("http-cache");
+        let url = "https://example.com/pricing.json";
+        let entry = CacheEntry::for_url(&dir, url);
+        entry.write("\"cached\"", LITELLM_BODY);
+        let confirmed_at = entry.confirmed_at().expect("cache entry has a timestamp");
+
+        let body = read_fresh_json_in(
+            &dir,
+            url,
+            PricingEndpoint::LiteLlm,
+            DAY,
+            confirmed_at - Duration::from_secs(60),
+        );
+
+        assert!(body.is_none(), "a skewed clock must not extend the cache");
+    }
+
+    #[test]
+    fn does_not_read_a_fresh_cache_body_for_the_wrong_endpoint() {
+        let fixture = Fixture::new();
+        let dir = fixture.path("http-cache");
+        let url = "https://example.com/pricing.json";
+        let entry = CacheEntry::for_url(&dir, url);
+        entry.write("\"models-dev\"", MODELS_DEV_BODY);
+        let confirmed_at = entry.confirmed_at().expect("cache entry has a timestamp");
+
+        let body = read_fresh_json_in(&dir, url, PricingEndpoint::LiteLlm, DAY, confirmed_at);
+
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn a_304_renews_the_cache_for_fresh_reads() {
+        let fixture = Fixture::new();
+        let dir = fixture.path("http-cache");
+        let (url, server) = serve_responses(vec![not_modified_response()]);
+        let entry = CacheEntry::for_url(&dir, &url);
+        entry.write("\"cached\"", LITELLM_BODY);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&entry.path)
+            .and_then(|file| file.set_modified(SystemTime::now() - 2 * DAY))
+            .expect("age the cache entry");
+        assert!(
+            read_fresh_json_in(&dir, &url, PricingEndpoint::LiteLlm, DAY, SystemTime::now())
+                .is_none()
+        );
+
+        fetch_json_with_cache_dir(&url, Some(&dir), PricingEndpoint::LiteLlm)
+            .expect("304 should reuse validated cache");
+        let _ = server
+            .join()
+            .expect("test server")
+            .expect("server response");
+
+        let fresh =
+            read_fresh_json_in(&dir, &url, PricingEndpoint::LiteLlm, DAY, SystemTime::now())
+                .expect("the 304 renewed the cache");
+        assert_eq!(fresh.body, LITELLM_BODY);
+        assert!(fresh.age < DAY);
     }
 
     #[test]

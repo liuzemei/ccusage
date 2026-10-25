@@ -29,6 +29,7 @@ fn main() -> Result<()> {
         models_dev_catalog_rules: ccusage_pricing_snapshots::MODELS_DEV_CATALOG_RULES,
     });
     pricing::set_json_fetcher(http::fetch_json);
+    pricing::set_fresh_json_reader(http::read_fresh_json);
     match cli::parse() {
         Command::All(args) => adapter::all::run(args),
         Command::Daily(args) => commands::run_daily(args),

@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -96,6 +96,14 @@ const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
 const MODELS_DEV_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// How long a LiteLLM response the server last confirmed may stand in for a
+/// live refresh. Past it, an online run refreshes up front.
+const LITELLM_PRICING_CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long after the server confirmed the cached LiteLLM response a run
+/// prices the models it lacks without asking again. Some models are in no
+/// table at all, so asking on every miss would put the request back on every
+/// run that uses one.
+const LITELLM_PRICING_MISS_REFRESH_AFTER: Duration = Duration::from_secs(60 * 60);
 // Anthropic date-suffixed model aliases use YYYYMMDD, while other numeric
 // suffixes are treated as distinct model versions.
 const MODEL_DATE_SUFFIX_DIGITS: usize = 8;
@@ -468,6 +476,10 @@ pub struct PricingMap {
     builtin_context_limits: FxHashMap<String, u64>,
     enable_models_dev_fallback: bool,
     enable_embedded_models_dev_fallback: bool,
+    /// Set when an online load took LiteLLM pricing from the on-disk cache
+    /// instead of the network, so a lookup that table cannot answer exactly
+    /// asks the live table first.
+    deferred_refresh: Option<DeferredRefresh>,
     find_cache: OnceLock<Mutex<FxHashMap<String, Option<Pricing>>>>,
     /// Every entry key under its normalized spelling, mapped to the one key
     /// carrying that spelling, or `None` when several keys share it.
@@ -571,9 +583,103 @@ impl Default for PricingMap {
             builtin_context_limits: FxHashMap::default(),
             enable_models_dev_fallback: false,
             enable_embedded_models_dev_fallback: false,
+            deferred_refresh: None,
             find_cache: OnceLock::new(),
             normalized_keys: OnceLock::new(),
         }
+    }
+}
+
+/// Where an online load reads LiteLLM pricing from.
+#[derive(Clone, Copy)]
+struct LiteLlmSources {
+    /// The last response the server confirmed within the cache max age, if any.
+    read_fresh: fn() -> Option<FreshJson>,
+    fetch: fn() -> std::io::Result<String>,
+}
+
+impl LiteLlmSources {
+    const INSTALLED: Self = Self {
+        read_fresh: read_fresh_pricing_json,
+        fetch: fetch_pricing_json,
+    };
+}
+
+/// The live LiteLLM table a cache-loaded [`PricingMap`] fetches the first time
+/// a lookup misses, shared with every map derived from it through
+/// [`PricingMap::with_user_overrides`] so a run fetches it at most once.
+#[derive(Debug)]
+struct LiveLiteLlmPricing {
+    fetch: fn() -> std::io::Result<String>,
+    /// The live table without user overrides, or `None` once the fetch failed.
+    pricing: OnceLock<Option<PricingMap>>,
+}
+
+#[derive(Debug)]
+struct DeferredRefresh {
+    live: Arc<LiveLiteLlmPricing>,
+    /// The map's user overrides in the order it applied them, replayed onto the
+    /// live table so both answer with the same rates.
+    overrides: Vec<(String, PricingOverride)>,
+    refreshed: OnceLock<Option<Box<PricingMap>>>,
+}
+
+impl DeferredRefresh {
+    fn new<'a>(
+        fetch: fn() -> std::io::Result<String>,
+        overrides: impl IntoIterator<Item = (&'a String, &'a PricingOverride)>,
+    ) -> Self {
+        let live = Arc::new(LiveLiteLlmPricing {
+            fetch,
+            pricing: OnceLock::new(),
+        });
+        Self::sharing(live, Vec::new(), overrides)
+    }
+
+    fn with_more_overrides<'a>(
+        &self,
+        overrides: impl IntoIterator<Item = (&'a String, &'a PricingOverride)>,
+    ) -> Self {
+        Self::sharing(Arc::clone(&self.live), self.overrides.clone(), overrides)
+    }
+
+    fn sharing<'a>(
+        live: Arc<LiveLiteLlmPricing>,
+        mut applied: Vec<(String, PricingOverride)>,
+        overrides: impl IntoIterator<Item = (&'a String, &'a PricingOverride)>,
+    ) -> Self {
+        applied.extend(
+            overrides
+                .into_iter()
+                .map(|(model, value)| (model.clone(), value.clone())),
+        );
+        Self {
+            live,
+            overrides: applied,
+            refreshed: OnceLock::new(),
+        }
+    }
+
+    fn refreshed(&self, missed_model: &str) -> Option<&PricingMap> {
+        self.refreshed
+            .get_or_init(|| {
+                let live = self
+                    .live
+                    .pricing
+                    .get_or_init(|| {
+                        if should_log_pricing_refresh_details() {
+                            eprintln!(
+                                "INFO  Cached LiteLLM pricing has no entry for {missed_model}; refreshing it."
+                            );
+                        }
+                        PricingMap::load_live(self.live.fetch)
+                    })
+                    .as_ref()?;
+                Some(Box::new(live.with_user_overrides(
+                    self.overrides.iter().map(|(model, value)| (model, value)),
+                )))
+            })
+            .as_deref()
     }
 }
 
@@ -1043,27 +1149,50 @@ impl PricingMap {
     where
         I: IntoIterator<Item = (&'a String, &'a PricingOverride)>,
     {
-        let mut map = Self::load_embedded();
-        if !offline {
-            let fetch_result = crate::progress::track_status(
-                log && crate::progress::usage_load_output_is_tty(),
-                "Refreshing model pricing from LiteLLM...",
-                fetch_pricing_json,
-            );
+        Self::load_with_sources(offline, log, overrides, LiteLlmSources::INSTALLED)
+    }
 
-            match fetch_result {
-                Ok(json) => {
-                    let loaded_count = map.load_json(&json);
-                    if loaded_count == 0 && should_log_pricing_refresh_details() {
-                        eprintln!("WARN  Failed to parse LiteLLM pricing; using embedded pricing.");
-                    }
+    /// An online load prices from the LiteLLM response on disk when the server
+    /// confirmed it within [`LITELLM_PRICING_CACHE_MAX_AGE`], and refreshes up
+    /// front otherwise. A response confirmed more than
+    /// [`LITELLM_PRICING_MISS_REFRESH_AFTER`] ago is refreshed by the first
+    /// lookup it cannot answer exactly. A more recently confirmed one answers
+    /// every lookup itself, falling back only to the embedded models.dev
+    /// snapshot, the way `--offline` answers with the embedded table.
+    ///
+    /// A user override prices its model on its own, so naming a model the
+    /// cached response lacks does not send a run to the network; a private
+    /// model would otherwise cost a request every run.
+    fn load_with_sources<'a, I>(
+        offline: bool,
+        log: bool,
+        overrides: I,
+        sources: LiteLlmSources,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a String, &'a PricingOverride)>,
+    {
+        let overrides: Vec<_> = overrides.into_iter().collect();
+        let mut map = Self::load_embedded();
+        let mut live_fallbacks = !offline;
+        if !offline {
+            let cached_age = (sources.read_fresh)()
+                .and_then(|cached| (map.load_json(&cached.body) > 0).then_some(cached.age));
+            match cached_age {
+                Some(age) if age < LITELLM_PRICING_MISS_REFRESH_AFTER => live_fallbacks = false,
+                Some(_) => {
+                    map.deferred_refresh = Some(DeferredRefresh::new(
+                        sources.fetch,
+                        overrides.iter().copied(),
+                    ));
                 }
-                Err(error) => {
-                    if should_log_pricing_refresh_details() {
-                        eprintln!(
-                            "WARN  Failed to fetch LiteLLM pricing ({error}); using embedded pricing."
-                        );
-                    }
+                None => {
+                    let fetch_result = crate::progress::track_status(
+                        log && crate::progress::usage_load_output_is_tty(),
+                        "Refreshing model pricing from LiteLLM...",
+                        sources.fetch,
+                    );
+                    map.load_fetched_litellm(fetch_result, "embedded");
                 }
             }
         }
@@ -1072,9 +1201,49 @@ impl PricingMap {
         // built-in long-context rates it does not publish before user
         // overrides get the final word.
         map.fill_long_context_rates_from_models_dev();
-        map.enable_models_dev_fallback = !offline;
+        map.enable_models_dev_fallback = live_fallbacks;
         map.apply_overrides(overrides);
         map
+    }
+
+    /// The table an online load builds from a live LiteLLM response, before
+    /// user overrides, or `None` when the response cannot be used.
+    fn load_live(fetch: fn() -> std::io::Result<String>) -> Option<Self> {
+        let mut map = Self::load_embedded();
+        if !map.load_fetched_litellm(fetch(), "cached") {
+            return None;
+        }
+        map.fill_long_context_rates_from_models_dev();
+        map.enable_models_dev_fallback = true;
+        Some(map)
+    }
+
+    /// Loads a fetched LiteLLM response, returning whether it priced anything.
+    fn load_fetched_litellm(&mut self, fetched: std::io::Result<String>, fallback: &str) -> bool {
+        match fetched {
+            Ok(json) => {
+                let loaded = self.load_json(&json) > 0;
+                if !loaded && should_log_pricing_refresh_details() {
+                    eprintln!("WARN  Failed to parse LiteLLM pricing; using {fallback} pricing.");
+                }
+                loaded
+            }
+            Err(error) => {
+                if should_log_pricing_refresh_details() {
+                    eprintln!(
+                        "WARN  Failed to fetch LiteLLM pricing ({error}); using {fallback} pricing."
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// The live table of a map whose LiteLLM pricing came from the on-disk
+    /// cache, fetched on the first call. `None` for any other map, and when the
+    /// fetch failed, so the cached table answers on its own.
+    fn refreshed_pricing(&self, missed_model: &str) -> Option<&PricingMap> {
+        self.deferred_refresh.as_ref()?.refreshed(missed_model)
     }
 
     /// Returns an independent pricing map with additional user overrides.
@@ -1086,6 +1255,7 @@ impl PricingMap {
     where
         I: IntoIterator<Item = (&'a String, &'a PricingOverride)>,
     {
+        let overrides: Vec<_> = overrides.into_iter().collect();
         let mut map = Self {
             entries: self.entries.clone(),
             user_overrides: self.user_overrides.clone(),
@@ -1094,6 +1264,10 @@ impl PricingMap {
             builtin_context_limits: self.builtin_context_limits.clone(),
             enable_models_dev_fallback: self.enable_models_dev_fallback,
             enable_embedded_models_dev_fallback: self.enable_embedded_models_dev_fallback,
+            deferred_refresh: self
+                .deferred_refresh
+                .as_ref()
+                .map(|deferred| deferred.with_more_overrides(overrides.iter().copied())),
             find_cache: OnceLock::new(),
             normalized_keys: OnceLock::new(),
         };
@@ -1479,6 +1653,12 @@ impl PricingMap {
             return Some(pricing);
         }
 
+        // A cached table can predate the model, so the live one answers before
+        // any fallback guesses, exactly as it would have in a run that fetched.
+        if let Some(refreshed) = self.refreshed_pricing(model) {
+            return refreshed.find(model);
+        }
+
         let embedded_models_dev = embedded_models_dev();
         let models_dev = models_dev();
         let fuzzy = self.allows_fuzzy_lookup_with_fallbacks(
@@ -1563,15 +1743,15 @@ impl PricingMap {
     /// Unlike [`Self::find`], this lookup does not resolve aliases or use
     /// separator and fuzzy matching.
     pub fn find_exact_with_fallback(&self, model: &str) -> Option<Pricing> {
-        self.find_exact_normalized(model)
-            .or_else(|| {
-                self.enable_models_dev_fallback
-                    .then(|| {
-                        models_dev_pricing()
-                            .and_then(|pricing| pricing.find_exact_normalized(model))
-                    })
-                    .flatten()
-            })
+        if let Some(pricing) = self.find_exact_normalized(model) {
+            return Some(pricing);
+        }
+        if let Some(refreshed) = self.refreshed_pricing(model) {
+            return refreshed.find_exact_with_fallback(model);
+        }
+        self.enable_models_dev_fallback
+            .then(|| models_dev_pricing().and_then(|pricing| pricing.find_exact_normalized(model)))
+            .flatten()
             .or_else(|| {
                 self.enable_embedded_models_dev_fallback
                     .then(|| embedded_models_dev_pricing().find_exact_normalized(model))
@@ -1779,6 +1959,10 @@ impl PricingMap {
             })
         {
             return Some(context_limit);
+        }
+
+        if let Some(refreshed) = self.refreshed_pricing(model) {
+            return refreshed.context_limit(model);
         }
 
         let embedded_models_dev = embedded_models_dev();
@@ -2945,6 +3129,31 @@ static JSON_FETCHER: OnceLock<JsonFetcher> = OnceLock::new();
 /// which is what `--offline` already does.
 pub fn set_json_fetcher(fetcher: JsonFetcher) {
     let _ = JSON_FETCHER.set(fetcher);
+}
+
+/// A cached pricing document and how long ago the server last confirmed it.
+pub struct FreshJson {
+    pub body: String,
+    pub age: Duration,
+}
+
+/// Reads a cached pricing document the server confirmed within the given age.
+pub type FreshJsonReader = fn(&str, Duration) -> Option<FreshJson>;
+
+static FRESH_JSON_READER: OnceLock<FreshJsonReader> = OnceLock::new();
+
+/// Installs the reader that lets an online load price from a recently
+/// confirmed on-disk response instead of the network.
+///
+/// It lives with the binary for the same reason as the fetcher. Without one,
+/// every online load refreshes from the network up front.
+pub fn set_fresh_json_reader(reader: FreshJsonReader) {
+    let _ = FRESH_JSON_READER.set(reader);
+}
+
+fn read_fresh_pricing_json() -> Option<FreshJson> {
+    let read = FRESH_JSON_READER.get()?;
+    read(LITELLM_PRICING_URL, LITELLM_PRICING_CACHE_MAX_AGE)
 }
 
 fn fetch_json_url(url: &str) -> std::io::Result<String> {
@@ -6240,6 +6449,347 @@ mod tests {
             assert_eq!(entry.cache_read, 5e-7); // explicit value, not 2e-7
             // cache_create still scaled since not explicitly provided
             assert!((entry.cache_create - 2.5e-6).abs() < 1e-15);
+        }
+    }
+
+    mod cached_litellm {
+        use super::super::{
+            FreshJson, LITELLM_PRICING_MISS_REFRESH_AFTER, LiteLlmSources, PricingMap,
+        };
+        use ccusage_cli::PricingOverride;
+        use std::{
+            collections::BTreeMap,
+            io,
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+
+        const CACHED: &str = r#"{
+            "cache-first-cached-model": {
+                "input_cost_per_token": 0.000001,
+                "output_cost_per_token": 0.000002,
+                "max_input_tokens": 1000
+            }
+        }"#;
+        const LIVE: &str = r#"{
+            "cache-first-cached-model": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000004,
+                "max_input_tokens": 1000
+            },
+            "cache-first-live-model": {
+                "input_cost_per_token": 0.000005,
+                "output_cost_per_token": 0.000006,
+                "max_input_tokens": 2000
+            }
+        }"#;
+
+        /// A cache old enough that a miss refreshes it.
+        fn fresh_cache() -> Option<FreshJson> {
+            Some(FreshJson {
+                body: CACHED.to_string(),
+                age: LITELLM_PRICING_MISS_REFRESH_AFTER,
+            })
+        }
+
+        fn just_confirmed_cache() -> Option<FreshJson> {
+            Some(FreshJson {
+                body: CACHED.to_string(),
+                age: Duration::from_secs(60),
+            })
+        }
+
+        fn no_fresh_cache() -> Option<FreshJson> {
+            None
+        }
+
+        fn load(offline: bool, sources: LiteLlmSources) -> PricingMap {
+            PricingMap::load_with_sources(
+                offline,
+                false,
+                std::iter::empty::<(&String, &PricingOverride)>(),
+                sources,
+            )
+        }
+
+        fn override_for(
+            model: &str,
+            init: impl FnOnce(&mut PricingOverride),
+        ) -> BTreeMap<String, PricingOverride> {
+            let mut value = PricingOverride::default();
+            init(&mut value);
+            BTreeMap::from([(model.to_string(), value)])
+        }
+
+        #[test]
+        fn prices_from_a_fresh_cache_without_fetching() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+
+            let pricing = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: fresh_cache,
+                    fetch,
+                },
+            );
+
+            let cached = pricing
+                .find("cache-first-cached-model")
+                .expect("cached model is priced");
+            assert_eq!((cached.input, cached.output), (0.000001, 0.000002));
+            assert_eq!(
+                pricing.context_limit("cache-first-cached-model"),
+                Some(1000)
+            );
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn fetches_once_when_the_cache_has_no_entry_for_a_model() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+
+            let pricing = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: fresh_cache,
+                    fetch,
+                },
+            );
+
+            let live = pricing
+                .find("cache-first-live-model")
+                .expect("a cache miss is priced from the live table");
+            assert_eq!((live.input, live.output), (0.000005, 0.000006));
+            let _ = pricing.find("cache-first-unpriced-model");
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_just_confirmed_cache_answers_misses_without_fetching() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+
+            let pricing = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: just_confirmed_cache,
+                    fetch,
+                },
+            );
+
+            let _ = pricing.find("cache-first-live-model");
+            let _ = pricing.find_exact_with_fallback("cache-first-live-model");
+            let _ = pricing.context_limit("cache-first-live-model");
+            let cached = pricing
+                .find("cache-first-cached-model")
+                .expect("cached model is priced");
+            assert_eq!(cached.input, 0.000001);
+            assert!(
+                !pricing.models_dev_fallback_enabled(),
+                "a just-confirmed cache must not reach models.dev over the network either"
+            );
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn keeps_cached_pricing_when_the_refresh_fails() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::new(io::ErrorKind::TimedOut, "offline"))
+            }
+
+            let pricing = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: fresh_cache,
+                    fetch,
+                },
+            );
+
+            let _ = pricing.find("cache-first-live-model");
+            let _ = pricing.find("cache-first-unpriced-model");
+            let cached = pricing
+                .find("cache-first-cached-model")
+                .expect("cached model stays priced");
+            assert_eq!(cached.input, 0.000001);
+            assert_eq!(
+                FETCHES.load(Ordering::SeqCst),
+                1,
+                "a failed refresh is not retried within one load"
+            );
+        }
+
+        #[test]
+        fn fetches_up_front_without_a_fresh_cache() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+
+            let pricing = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: no_fresh_cache,
+                    fetch,
+                },
+            );
+
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+            let cached = pricing
+                .find("cache-first-cached-model")
+                .expect("live table prices the model");
+            assert_eq!(cached.input, 0.000003);
+        }
+
+        #[test]
+        fn offline_load_neither_reads_the_cache_nor_fetches() {
+            static READS: AtomicUsize = AtomicUsize::new(0);
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn read_fresh() -> Option<FreshJson> {
+                READS.fetch_add(1, Ordering::SeqCst);
+                fresh_cache()
+            }
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+
+            let pricing = load(true, LiteLlmSources { read_fresh, fetch });
+            let _ = pricing.find("cache-first-live-model");
+
+            assert_eq!(READS.load(Ordering::SeqCst), 0);
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn context_limit_misses_refresh_from_the_live_table() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+
+            let pricing = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: fresh_cache,
+                    fetch,
+                },
+            );
+
+            assert_eq!(
+                pricing.context_limit("cache-first-cached-model"),
+                Some(1000)
+            );
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 0);
+            assert_eq!(pricing.context_limit("cache-first-live-model"), Some(2000));
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn exact_lookup_misses_refresh_from_the_live_table() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+
+            let pricing = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: fresh_cache,
+                    fetch,
+                },
+            );
+
+            let live = pricing
+                .find_exact_with_fallback("cache-first-live-model")
+                .expect("an exact miss is priced from the live table");
+            assert_eq!(live.input, 0.000005);
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn user_overrides_price_a_model_the_cache_lacks_without_fetching() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+            let overrides = override_for("private-gateway-model", |value| {
+                value.input_cost_per_token = Some(0.000007);
+                value.output_cost_per_token = Some(0.000008);
+            });
+
+            let pricing = PricingMap::load_with_sources(
+                false,
+                false,
+                overrides.iter(),
+                LiteLlmSources {
+                    read_fresh: fresh_cache,
+                    fetch,
+                },
+            );
+
+            let private = pricing
+                .find("private-gateway-model")
+                .expect("override prices the model");
+            assert_eq!((private.input, private.output), (0.000007, 0.000008));
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn derived_maps_share_one_refresh_and_keep_their_own_overrides() {
+            static FETCHES: AtomicUsize = AtomicUsize::new(0);
+            fn fetch() -> io::Result<String> {
+                FETCHES.fetch_add(1, Ordering::SeqCst);
+                Ok(LIVE.to_string())
+            }
+            let base = load(
+                false,
+                LiteLlmSources {
+                    read_fresh: fresh_cache,
+                    fetch,
+                },
+            );
+            let output_override = override_for("cache-first-cached-model", |value| {
+                value.output_cost_per_token = Some(0.000009);
+            });
+            let input_override = override_for("cache-first-cached-model", |value| {
+                value.input_cost_per_token = Some(0.000007);
+            });
+            let with_output = base.with_user_overrides(output_override.iter());
+            let with_input = base.with_user_overrides(input_override.iter());
+
+            assert!(with_output.find("cache-first-live-model").is_some());
+            assert!(with_input.find("cache-first-live-model").is_some());
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+
+            let refreshed = with_output
+                .refreshed_pricing("cache-first-live-model")
+                .expect("refresh succeeded")
+                .find_exact("cache-first-cached-model")
+                .expect("live table has the model");
+            assert_eq!((refreshed.input, refreshed.output), (0.000003, 0.000009));
+            let refreshed = with_input
+                .refreshed_pricing("cache-first-live-model")
+                .expect("refresh succeeded")
+                .find_exact("cache-first-cached-model")
+                .expect("live table has the model");
+            assert_eq!((refreshed.input, refreshed.output), (0.000007, 0.000004));
         }
     }
 }
